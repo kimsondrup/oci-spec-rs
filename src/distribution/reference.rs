@@ -76,6 +76,90 @@ pub enum ParseError {
 /// assert_eq!(Some("latest"), reference.tag());
 /// assert_eq!(None, reference.digest());
 /// ```
+///
+/// # Registry host normalization (feature `normalize-registry`)
+///
+/// The same registry host can be written in many ways. Host names are case-insensitive,
+/// a Unicode domain name has an ASCII form (punycode, which starts with `xn--`), and an
+/// IPv6 address can be written with or without zeros. With the
+/// `normalize-registry` feature, parsing writes the registry host in one normalized
+/// form, so the same registry usually gives the same `registry()` (see the exceptions
+/// below):
+///
+/// | Input                        | Registry                     |
+/// |------------------------------|------------------------------|
+/// | `bücher.example/app`         | `xn--bcher-kva.example`      |
+/// | `Bücher.Example/app`         | `xn--bcher-kva.example`      |
+/// | `Registry.Example.COM/app`   | `registry.example.com`       |
+/// | `bücher。example:5000/app`   | `xn--bcher-kva.example:5000` |
+/// | `[2001:DB8:0:0::1]:5000/app` | `[2001:db8::1]:5000`         |
+///
+/// The normalized form is the one the [URL Standard]'s [host parser] gives, which
+/// Chromium, Firefox and Safari follow. The [`idna`] and [`url`] crates do the parsing.
+///
+/// The host is the part before the first `/`, without the port, which is kept as
+/// written. It is normalized according to its kind:
+///
+/// - A domain name is converted with the URL Standard's [domain to ASCII], which uses
+///   [IDNA] (the standard for domain names in any script): letters are lowercased,
+///   Unicode labels (the parts between dots) become punycode, and full stops such as
+///   the ideographic `。` become `.`. The result must fit the reference grammar: only
+///   letters, digits and `-` in a label, no `-` at the start or end of a label, at most
+///   63 bytes per label and 253 bytes in total.
+/// - An IPv4 address must be written in dotted decimal, four numbers from 0 to 255
+///   without leading zeros, as RFC 3986 requires, and is kept as written. The URL
+///   Standard, like browsers and C's `inet_aton`, also reads short and non-decimal
+///   forms as IPv4: a part starting with `0x` is hex, a part starting with `0` is
+///   octal, and the last part fills the remaining bytes, so `127.1` and `0x7f.1` are
+///   `127.0.0.1`, and `010.0.0.1` is `8.0.0.1`, not `10.0.0.1`. Go's `net` package
+///   doesn't read these forms as IP addresses at all. So a host that the URL Standard
+///   reads as IPv4, which includes any host whose last label is a number, must already
+///   be in dotted decimal, or the reference is invalid.
+/// - An IPv6 address in brackets is written in lowercase hex without leading zeros,
+///   with the longest run of two or more zero groups (the first, if tied) as `::`, as
+///   RFC 5952 recommends. An IPv6 address that embeds an IPv4 address, such as
+///   `::ffff:192.0.2.128`, is written all in hex (`[::ffff:c000:280]`), as the URL
+///   Standard always does. The reference grammar doesn't allow `.` in brackets anyway.
+///
+/// A host without brackets is only normalized if, after domain to ASCII, it has a `.` or
+/// a port. Without the feature, a first component without `.` or `:` is a Docker Hub
+/// namespace, unless it is `localhost` or has an uppercase letter, so lowercasing it
+/// could change its meaning: the host `Foo` in `Foo/bar` would become the Docker Hub
+/// repository `foo/bar`. So `Foo/bar` keeps the registry `Foo`, `2130706433/app` stays a
+/// Docker Hub repository, and `bücher/app` is rejected, because a repository must be
+/// ASCII.
+///
+/// If the URL Standard or the reference grammar rejects a host, or an IPv4 address is not
+/// in dotted decimal, the reference is invalid
+/// ([`ParseError::ReferenceInvalidFormat`]), even if it parses without the feature. For
+/// example:
+///
+/// - `foo_bar.example/app`: `_` is not allowed in a host. Without the feature, the whole
+///   name is the repository, where `_` is allowed;
+/// - `127.1/app` and `010.0.0.1/app`: IPv4 addresses not in dotted decimal;
+/// - `256.0.0.1/app` and `example.1/app`: not valid IPv4 addresses;
+/// - `[00001::]/app`: not a valid IPv6 address;
+/// - `XN--A.example/app`: not valid punycode;
+/// - `XN--9DBNE9B.1abc/app`: its first label is Hebrew, and the Unicode rule for
+///   right-to-left text then also forbids a label starting with a digit.
+///
+/// A reference that is invalid without the feature keeps its error. A first component
+/// without `.` and `:` is not a host, so `foo_bar/app` is still the Docker Hub repository
+/// `foo_bar/app`.
+///
+/// Docker Hub's hosts (`docker.io` and `index.docker.io`) are recognized after
+/// normalizing, so `Docker.IO/alpine` gets the repository `library/alpine`, like
+/// `docker.io/alpine`.
+///
+/// Only parsing normalizes. [`Reference::with_tag`] and the other constructors,
+/// [`Reference::set_mirror_registry`] and deserializing keep the registry as given.
+///
+/// [IDNA]: https://www.unicode.org/reports/tr46/
+/// [URL Standard]: https://url.spec.whatwg.org/
+/// [host parser]: https://url.spec.whatwg.org/#host-parsing
+/// [domain to ASCII]: https://url.spec.whatwg.org/#concept-domain-to-ascii
+/// [`url`]: https://docs.rs/url
+/// [`idna`]: https://docs.rs/idna
 #[derive(Clone, Hash, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Reference {
     registry: String,
@@ -278,23 +362,41 @@ impl TryFrom<&str> for Reference {
     /// `library/` prefix. Unlike Go, the tag is also set to `latest` when there is no
     /// tag and no digest.
     ///
+    /// With the `normalize-registry` feature, the registry host is normalized first, see
+    /// [Registry host normalization](Reference#registry-host-normalization-feature-normalize-registry).
+    ///
     /// [`ParseNormalizedNamed`]: https://github.com/distribution/reference/blob/v0.6.0/normalize.go#L56
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        if s.is_empty() {
-            return Err(ParseError::NameEmpty);
+        #[cfg(feature = "normalize-registry")]
+        match normalize_host(s) {
+            Host::Normalized(normalized) => return parse_host_as_written(&normalized),
+            // Keep the error the input gives without the feature, if any.
+            Host::Invalid => {
+                return parse_host_as_written(s).and(Err(ParseError::ReferenceInvalidFormat))
+            }
+            Host::Absent => {}
         }
-        // A bare 64 character lowercase hex string is an image ID, not a repository name:
-        // https://github.com/distribution/reference/blob/v0.6.0/normalize.go#L57
-        if is_identifier(s) {
-            return Err(ParseError::ReferenceInvalidFormat);
-        }
-        let (domain, remainder) = split_docker_domain(s);
-        let remote = remainder.split(':').next().unwrap_or_default();
-        if has_uppercase(remote) {
-            return Err(ParseError::NameContainsUppercase);
-        }
-        parse_strict(&format!("{domain}/{remainder}"))
+        parse_host_as_written(s)
     }
+}
+
+/// Parses a reference with the registry host as written. This is `Reference::try_from`
+/// without the `normalize-registry` feature.
+fn parse_host_as_written(s: &str) -> Result<Reference, ParseError> {
+    if s.is_empty() {
+        return Err(ParseError::NameEmpty);
+    }
+    // A bare 64 character lowercase hex string is an image ID, not a repository name:
+    // https://github.com/distribution/reference/blob/v0.6.0/normalize.go#L57
+    if is_identifier(s) {
+        return Err(ParseError::ReferenceInvalidFormat);
+    }
+    let (domain, remainder) = split_docker_domain(s);
+    let remote = remainder.split(':').next().unwrap_or_default();
+    if has_uppercase(remote) {
+        return Err(ParseError::NameContainsUppercase);
+    }
+    parse_strict(&format!("{domain}/{remainder}"))
 }
 
 impl TryFrom<String> for Reference {
@@ -581,6 +683,131 @@ fn split_docker_domain(name: &str) -> (&str, String) {
     (domain, remainder.to_owned())
 }
 
+/// What [`normalize_host`] found before the first `/`.
+#[cfg(feature = "normalize-registry")]
+enum Host {
+    /// `s` with its host replaced by the normalized form.
+    Normalized(String),
+    /// A host that can't be normalized, such as `256.0.0.1` or `foo_bar.example`.
+    Invalid,
+    /// There is no host, so `s` is parsed as written: there is no `/`, or the first
+    /// component has no `.` and no port, such as `Foo` in `Foo/bar` or `foo_bar` in
+    /// `foo_bar/app`.
+    Absent,
+}
+
+/// Normalizes the registry host of `s` (the part before the first `/`, without the
+/// port), with the URL Standard's [host parser] deciding what kind of host it is. The
+/// port is kept as written.
+///
+/// 1. An ASCII first component without `.` and `:` is not a host but a Docker Hub
+///    namespace, as without the feature, such as `Foo` in `Foo/bar`, `foo_bar` in
+///    `foo_bar/app` or `2130706433` in `2130706433/app`, see [`Reference`] for why.
+/// 2. A host with `%` is invalid, because the host parser would percent-decode it.
+/// 3. The host parser (`url::Host::parse`) says what kind of host it is:
+///    - an IPv6 address must also fit the reference grammar, and is written in its
+///      normalized form;
+///    - an IPv4 address must be written exactly as the host parser writes it;
+///    - a domain is converted with [`domain_to_ascii`], which is stricter than the host
+///      parser. A Unicode host without a `.` after that, such as `bücher` in
+///      `bücher/app`, is not a host either.
+///
+/// [host parser]: https://url.spec.whatwg.org/#host-parsing
+#[cfg(feature = "normalize-registry")]
+fn normalize_host(s: &str) -> Host {
+    let Some((first, rest)) = s.split_once('/') else {
+        return Host::Absent;
+    };
+    if first.is_ascii() && !first.contains(['.', ':']) {
+        return Host::Absent;
+    }
+    // The port is the digits after the last `:`. An IPv6 address such as `[::1]` ends
+    // with `]`, so its own `:` are never taken for a port.
+    let (raw, port) = match first.rsplit_once(':') {
+        Some((host, digits))
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            first.split_at(host.len())
+        }
+        _ => (first, ""),
+    };
+    if raw.contains('%') {
+        return Host::Invalid;
+    }
+    match url::Host::parse(raw) {
+        Ok(url::Host::Ipv6(address)) => {
+            // The reference grammar only allows an IPv6 address in hex form (RFC 4291 §2.2,
+            // forms 1 and 2). The host parser also accepts the mixed form with an IPv4 part
+            // (form 3), such as `::ffff:192.0.2.1`.
+            let inside = raw.trim_start_matches('[').trim_end_matches(']');
+            if inside.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
+                let host = url::Host::<String>::Ipv6(address);
+                Host::Normalized(format!("{host}{port}/{rest}"))
+            } else {
+                Host::Invalid
+            }
+        }
+        // An IPv4 address must be written exactly in dotted decimal, so short, hex,
+        // octal and fullwidth forms such as `127.1`, `0x7f.1`, `010.0.0.1` or
+        // `１２７.0.0.1` are invalid instead of normalized.
+        Ok(url::Host::Ipv4(address)) if address.to_string() == raw => {
+            Host::Normalized(format!("{raw}{port}/{rest}"))
+        }
+        Ok(url::Host::Ipv4(_)) => Host::Invalid,
+        Ok(url::Host::Domain(_)) => match domain_to_ascii(raw) {
+            None => Host::Invalid,
+            Some(domain) if !domain.contains('.') && port.is_empty() => Host::Absent,
+            Some(domain) => Host::Normalized(format!("{domain}{port}/{rest}")),
+        },
+        Err(_) => Host::Invalid,
+    }
+}
+
+/// Converts a domain name to its normalized ASCII form with the URL Standard's
+/// [domain to ASCII], in its strict mode (`beStrict`), except for `--` (see below).
+/// Returns `None` if the domain is rejected.
+///
+/// The OCI specs don't define the registry host, so the reference grammar is
+/// distribution/reference's [`domain-component`], which follows the DNS host name rules
+/// ([RFC 1123 §2.1]): only letters, digits and `-` in a label (a part between dots), and
+/// no `-` at the start or end of a label. The URL Standard's strict mode has these
+/// checks, so the result always fits the grammar.
+///
+/// The strict mode also rejects `--` as the third and fourth characters of a label,
+/// because that spot is reserved for prefixes such as `xn--` (punycode). This function
+/// allows it, as browsers do, because real hosts use it, for example YouTube's
+/// `r4---sn-4g5e6nsz.googlevideo.com`.
+///
+/// [domain to ASCII]: https://url.spec.whatwg.org/#concept-domain-to-ascii
+/// [`domain-component`]: https://github.com/distribution/reference/blob/v0.6.0/reference.go#L11
+/// [RFC 1123 §2.1]: https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+#[cfg(feature = "normalize-registry")]
+fn domain_to_ascii(domain: &str) -> Option<String> {
+    use idna::uts46::{AsciiDenyList, DnsLength, Hyphens, Uts46};
+
+    // `to_ascii` always does these, as the URL Standard does in both modes:
+    // - lowercases, and turns Unicode labels into punycode (`xn--…`);
+    // - keeps `ß` as `ß` instead of turning it into `ss` (non-transitional processing),
+    //   so `faß.de` and `fass.de` stay different domains;
+    // - applies the Unicode Bidi rule to domains with right-to-left labels, such as
+    //   Hebrew or Arabic (`CheckBidi`);
+    // - rejects the invisible joiners U+200C and U+200D where they don't belong
+    //   (`CheckJoiners`);
+    // - rejects `xn--` labels that are not valid punycode.
+    let ascii = Uts46::new().to_ascii(
+        domain.as_bytes(),
+        // Only letters, digits and `-` (`UseSTD3ASCIIRules`, on with `beStrict`).
+        AsciiDenyList::STD3,
+        // No `-` at the start or end of a label, but `--` as the third and fourth
+        // characters is allowed (`beStrict` would reject both).
+        Hyphens::CheckFirstLast,
+        // Labels of 1 to 63 bytes, at most 253 bytes in total, and no trailing dot
+        // (`VerifyDnsLength`, on with `beStrict`).
+        DnsLength::Verify,
+    );
+    ascii.ok().map(String::from)
+}
+
 /// Whether the first component of a reference is treated as a domain.
 ///
 /// As in Go's `splitDockerDomain`, Docker Hub names are always lowercase, so a first
@@ -837,6 +1064,22 @@ mod test {
         /// tag and digest) is also checked against the regular expressions in the OCI specs
         /// (the `spec` module), and the whole result against the regular expressions of
         /// distribution/reference (the `go` module), which must split it the same way.
+        /// Checks that `Reference::try_from` gives `reference`, the result without the
+        /// feature, or with the `normalize-registry` feature the same as for
+        /// `reference.whole()`. So the feature normalizes a reference the same way whether
+        /// it is given the input or the result without the feature.
+        fn assert_same_with_try_from(input: &str, reference: &Reference) {
+            let ours = Reference::try_from(input);
+            #[cfg(not(feature = "normalize-registry"))]
+            let expected = Ok(reference.clone());
+            #[cfg(feature = "normalize-registry")]
+            let expected = Reference::try_from(reference.whole().as_str());
+            assert!(
+                ours == expected,
+                "try_from({input:?}) gives {ours:?}, expected {expected:?}"
+            );
+        }
+
         #[rstest(input, registry, repository, tag, digest, whole,
             case("busybox", "docker.io", "library/busybox", Some("latest"), None, "docker.io/library/busybox:latest"),
             case("test.com:tag", "docker.io", "library/test.com", Some("tag"), None, "docker.io/library/test.com:tag"),
@@ -892,8 +1135,9 @@ mod test {
             whole: &str,
         ) {
             println!("input: {}", input);
-            let reference = assert_parses(|s| Reference::try_from(s), input);
+            let reference = assert_parses(parse_host_as_written, input);
             println!("{} -> {:?}", input, reference);
+            assert_same_with_try_from(input, &reference);
             assert_field("registry", input, registry, reference.registry());
             assert_field("repository", input, repository, reference.repository());
             assert_field("tag", input, tag, reference.tag());
@@ -952,9 +1196,6 @@ mod test {
             case("[::1/app", ParseError::ReferenceInvalidFormat, None),
             case("[::g]/app", ParseError::ReferenceInvalidFormat, None),
             case("-a.com/app", ParseError::ReferenceInvalidFormat, None),
-            // Unicode domains are not supported.
-            case("bücher.example/app", ParseError::ReferenceInvalidFormat, None),
-            case("☃.com/myimage", ParseError::ReferenceInvalidFormat, None),
             // A 64 character hex name is an image ID.
             case(&"f".repeat(64), ParseError::ReferenceInvalidFormat, None),
             // go-digest requires lowercase hex: https://github.com/opencontainers/go-digest/blob/v1.0.0/algorithm.go#L58-L62
@@ -1008,7 +1249,12 @@ mod test {
             case(&format!("registry.test/image:{}", "x".repeat(129)), ParseError::ReferenceInvalidFormat, tag("x".repeat(129))),
         )]
         fn parse_bad_reference(input: &str, err: ParseError, rejected: Option<Part>) {
-            assert_rejected(|s| Reference::try_from(s), input, err);
+            let ours = Reference::try_from(input);
+            assert!(
+                ours == parse_host_as_written(input),
+                "try_from({input:?}) gives {ours:?}, but without the feature {err:?}"
+            );
+            assert_rejected(parse_host_as_written, input, err);
             let (part, spec_accepts) = match &rejected {
                 Some(Part::Name(name)) => (name, spec::name(name)),
                 Some(Part::Tag(tag)) => (tag, spec::tag(tag)),
@@ -1022,6 +1268,25 @@ mod test {
             assert!(
                 !spec_accepts,
                 "{rejected:?} is marked as the invalid part of {input:?}, but the spec accepts it"
+            );
+        }
+
+        /// Unicode hosts are rejected, as in Go. With the `normalize-registry` feature, they
+        /// are normalized instead, see the `normalize_registry` tests.
+        #[rstest]
+        #[case("bücher.example/app")]
+        #[case("☃.com/myimage")]
+        fn unicode_host_rejected_without_feature(#[case] input: &str) {
+            assert_rejected(
+                parse_host_as_written,
+                input,
+                ParseError::ReferenceInvalidFormat,
+            );
+            #[cfg(not(feature = "normalize-registry"))]
+            assert_rejected(
+                |s| Reference::try_from(s),
+                input,
+                ParseError::ReferenceInvalidFormat,
             );
         }
 
@@ -1134,6 +1399,474 @@ mod test {
                 digest.to_string(),
             );
             assert_eq!(expected, reference.to_string());
+        }
+    }
+
+    #[cfg(feature = "normalize-registry")]
+    mod normalize_registry {
+        use super::*;
+        use rstest::rstest;
+
+        /// Checks a successful parse, and that the result parses back to the same reference,
+        /// with and without the feature.
+        fn assert_normalized(input: &str, registry: &str, repository: &str) {
+            let reference = assert_parses(|s| Reference::try_from(s), input);
+            assert_field("registry", input, registry, reference.registry());
+            assert_field("repository", input, repository, reference.repository());
+            let whole = reference.whole();
+            for (parser, reparsed) in [
+                ("try_from", Reference::try_from(whole.as_str())),
+                ("parse_host_as_written", parse_host_as_written(&whole)),
+            ] {
+                assert!(
+                    reparsed.as_ref() == Ok(&reference),
+                    "{input:?} gives {whole:?}, but {parser} parses that as {reparsed:?}"
+                );
+            }
+        }
+
+        /// ASCII hosts are normalized by IDNA too: letters are lowercased. A first component
+        /// that is not a host is kept as written, so the result is the same as without the
+        /// feature. For hosts that can't be normalized, see `invalid_host`.
+        #[rstest]
+        #[case("Registry.Example.COM/app", "registry.example.com", "app")]
+        #[case("Registry.Example.COM:5000/app", "registry.example.com:5000", "app")]
+        // `--` as the third and fourth characters is allowed.
+        #[case("ab--c.example/app", "ab--c.example", "app")]
+        #[case("ls---x.example/app", "ls---x.example", "app")]
+        // No `.` and no port, so `foo_bar` is a Docker Hub namespace, not a host, although
+        // a host may not contain `_`.
+        #[case("foo_bar/app", "docker.io", "foo_bar/app")]
+        // No `.` and no port, so not normalized: `Foo` stays a host, as without the
+        // feature. Lowercased, it would become the Docker Hub repository `foo/bar`.
+        #[case("Foo/bar", "Foo", "bar")]
+        // Docker Hub names and `localhost`, unchanged.
+        #[case("busybox", "docker.io", "library/busybox")]
+        #[case("foo/bar", "docker.io", "foo/bar")]
+        #[case("localhost/app", "localhost", "app")]
+        #[case("index.docker.io/app", "docker.io", "library/app")]
+        // Docker Hub's hosts are matched after normalizing, so their case does not matter.
+        #[case("Docker.IO/app", "docker.io", "library/app")]
+        #[case("INDEX.docker.io/app", "docker.io", "library/app")]
+        // Other hosts, including other Docker Hub hosts, are only lowercased.
+        #[case("Registry-1.Docker.IO/org/app", "registry-1.docker.io", "org/app")]
+        #[case("docker.io:443/alpine", "docker.io:443", "alpine")]
+        fn ascii(#[case] input: &str, #[case] registry: &str, #[case] repository: &str) {
+            assert_normalized(input, registry, repository);
+        }
+
+        #[rstest]
+        #[case("bücher.example/app", "xn--bcher-kva.example", "app")]
+        // ASCII labels are lowercased as well.
+        #[case("Bücher.Example:5000/app", "xn--bcher-kva.example:5000", "app")]
+        #[case("MyReg.bücher.example/app", "myreg.xn--bcher-kva.example", "app")]
+        #[case("ls---x.bücher.example/app", "ls---x.xn--bcher-kva.example", "app")]
+        // `--` as the third and fourth characters is allowed, as in browsers.
+        #[case("bü--c.example/app", "xn--b--c-0ra.example", "app")]
+        #[case("bücher\u{3002}example/app", "xn--bcher-kva.example", "app")]
+        #[case("bücher\u{FF0E}example/app", "xn--bcher-kva.example", "app")]
+        #[case("bücher:5000/app", "xn--bcher-kva:5000", "app")]
+        // The Unicode forms of the punycode domains in the `parse` tests.
+        #[case("☃.com/myimage", "xn--n3h.com", "myimage")]
+        #[case("🐳.com/myimage", "xn--7o8h.com", "myimage")]
+        // Normalization done by IDNA:
+        // `ß` is kept ("faß"); older IDNA (2003) turned it into "ss". Uppercase Greek is
+        // lowercased ("σασ").
+        #[case("faß.de/app", "xn--fa-hia.de", "app")]
+        #[case("ΣΑΣ.gr/app", "xn--mxa9ab.gr", "app")]
+        // Decomposed Unicode (NFD): "u" followed by a combining diaeresis gives the same
+        // result as "ü".
+        #[case("bu\u{308}cher.example/app", "xn--bcher-kva.example", "app")]
+        // Fullwidth letters are turned into ASCII.
+        #[case("ｅｘａｍｐｌｅ.com/app", "example.com", "app")]
+        // A right-to-left (Hebrew) label.
+        #[case("שלום.example/app", "xn--9dbne9b.example", "app")]
+        // A soft hyphen is invisible and removed by IDNA.
+        #[case("exam\u{AD}ple.cöm/app", "example.xn--cm-fka", "app")]
+        // A look-alike letter (Cyrillic "а") gives a different host than "apple.com".
+        #[case("\u{430}pple.com/app", "xn--pple-43d.com", "app")]
+        // A valid punycode label is kept.
+        #[case(
+            "xn--bcher-kva.bücher.example/app",
+            "xn--bcher-kva.xn--bcher-kva.example",
+            "app"
+        )]
+        fn good(#[case] input: &str, #[case] registry: &str, #[case] repository: &str) {
+            assert_normalized(input, registry, repository);
+        }
+
+        #[rstest]
+        // A label must not start or end with `-`, and ASCII characters other than
+        // letters, digits and `-` are not allowed.
+        #[case("-bücher.example/app")]
+        #[case("bücher-.example/app")]
+        #[case("bü_cher.example/app")]
+        #[case("bad hüst.example/app")]
+        // Zero width joiner and non-joiner.
+        #[case("\u{200D}.com/app")]
+        #[case("exa\u{200C}mple.cöm/app")]
+        // Mixing left-to-right and right-to-left letters in one label breaks the Bidi rule.
+        #[case("aשלום.example/app")]
+        // Not a valid host or port.
+        #[case("bücher.example./app")]
+        #[case("bücher..example/app")]
+        #[case(" bücher.example/app")]
+        #[case("bücher.example\n/app")]
+        #[case("bü\tcher.example/app")]
+        #[case("user@bücher.example/app")]
+        #[case("bücher.example\u{FF1A}5000/app")]
+        #[case("bücher.example:５０００/app")]
+        #[case("bücher.example:port/app")]
+        // Percent-encoding is not decoded.
+        #[case("b%C3%BCcher.example/app")]
+        // IDNA maps U+2100 (℀) to "a/c" and U+FE55 (small colon) to `:`. Only letters,
+        // digits and `-` are allowed, so these are rejected and can't change where the
+        // host ends.
+        #[case("bücher.ex\u{2100}ample/app")]
+        #[case("bücher.example\u{FE55}5000/app")]
+        // A label longer than 63 bytes in punycode (for the whole domain, see
+        // `domain_length`).
+        #[case(&format!("{}.example/app", "ü".repeat(70)))]
+        // `xn--` followed by non-ASCII characters, and invalid punycode next to a Unicode
+        // label.
+        #[case("xn--kitty-點看pd34d.com/app")]
+        #[case("xn--not-valid.bücher.example/app")]
+        // Only the host may contain Unicode. The repository and tag must be ASCII.
+        #[case("bücher.example/bücher")]
+        #[case("bücher.example/app:tagé")]
+        // Without a `.` or `:` after IDNA, the first component is not a host, so it is left
+        // as written, and the non-ASCII repository is rejected.
+        #[case("bücher/app")]
+        fn bad(#[case] input: &str) {
+            assert_rejected(
+                |s| Reference::try_from(s),
+                input,
+                ParseError::ReferenceInvalidFormat,
+            );
+        }
+
+        /// IPv6 hosts are written as in the URL Standard.
+        #[rstest]
+        #[case("[2001:DB8:0:0::1]:5000/app", "[2001:db8::1]:5000")]
+        #[case("[2001:0db8:0000:0000:0000:0000:0000:0001]/app", "[2001:db8::1]")]
+        #[case("[0:0:0:0:0:0:0:0]/app", "[::]")]
+        #[case("[::1]/app", "[::1]")]
+        #[case("[1::]/app", "[1::]")]
+        // The first longest run of zeros is shortened, and a single zero is not.
+        #[case("[1:0:0:1:0:0:0:1]/app", "[1:0:0:1::1]")]
+        #[case("[1:0:0:0:1:0:0:1]/app", "[1::1:0:0:1]")]
+        #[case("[2001:db8:0:1:1:1:1:1]/app", "[2001:db8:0:1:1:1:1:1]")]
+        // An IPv4 mapped address stays in hex.
+        #[case("[::FFFF:C000:280]/app", "[::ffff:c000:280]")]
+        fn ipv6(#[case] input: &str, #[case] registry: &str) {
+            assert_normalized(input, registry, "app");
+        }
+
+        /// An IPv4 address in dotted decimal is kept. Other forms are invalid, see
+        /// `invalid_host`.
+        #[rstest]
+        #[case("127.0.0.1/app", "127.0.0.1", "app")]
+        #[case("10.0.0.1:5000/app", "10.0.0.1:5000", "app")]
+        #[case("255.255.255.255/app", "255.255.255.255", "app")]
+        // Without a `.` or port, the first component is not a host, as without the
+        // feature.
+        #[case("2130706433/app", "docker.io", "2130706433/app")]
+        fn ipv4(#[case] input: &str, #[case] registry: &str, #[case] repository: &str) {
+            assert_normalized(input, registry, repository);
+        }
+
+        /// Unicode hosts that are read as IPv4 are invalid, as they are without the feature:
+        /// IDNA maps `①` to `1`, so the first is not a valid IPv4 address, and the second is
+        /// not written in plain dotted decimal.
+        #[rstest]
+        #[case("bücher.example.①/app")]
+        #[case("１２７.０.０.１/app")]
+        fn unicode_host_read_as_ipv4(#[case] input: &str) {
+            assert_rejected(
+                |s| Reference::try_from(s),
+                input,
+                ParseError::ReferenceInvalidFormat,
+            );
+        }
+
+        /// For every address made of zero and non-zero pieces, the result is the same as
+        /// from the standard library (RFC 5952), except for IPv4 mapped addresses, which the
+        /// standard library writes with an embedded IPv4 address.
+        #[test]
+        fn ipv6_matches_std() {
+            let mut mapped = 0;
+            for bits in 0..=u8::MAX {
+                for value in [0x1, 0xab, 0xffff] {
+                    let pieces: [u16; 8] =
+                        std::array::from_fn(|i| if bits >> i & 1 == 1 { value } else { 0 });
+                    let address = std::net::Ipv6Addr::from(pieces);
+                    let long = pieces.map(|p| format!("{p:04X}")).join(":");
+                    let ours = Reference::try_from(format!("[{long}]/app"))
+                        .ok()
+                        .map(|r| r.registry().trim_matches(['[', ']']).to_owned());
+                    let std = address.to_string();
+                    if std.contains('.') {
+                        mapped += 1;
+                        assert!(
+                            ours.as_deref().is_some_and(|o| !o.contains('.')),
+                            "{long}: {ours:?}"
+                        );
+                        continue;
+                    }
+                    assert!(
+                        ours.as_deref() == Some(std.as_str()),
+                        "{long}: {ours:?}, expected {std:?}"
+                    );
+                }
+            }
+            assert!(mapped > 0, "no IPv4 mapped address was tested");
+        }
+
+        /// IPv6 hosts that the grammar does not allow are rejected, as without the feature,
+        /// even if they are valid IPv6 addresses.
+        #[rstest]
+        #[case("[::ffff:192.0.2.128]/app")]
+        #[case("[abcdef]/app")]
+        #[case("[fe80::1%eth0]/app")]
+        fn invalid_ipv6(#[case] input: &str) {
+            assert_rejected(
+                |s| Reference::try_from(s),
+                input,
+                ParseError::ReferenceInvalidFormat,
+            );
+        }
+
+        /// A host that is only dots fails the same way with `.` and `。`, and with the same
+        /// error as without the feature.
+        #[rstest]
+        #[case(".", "。")]
+        #[case("./app", "。/app")]
+        #[case(".:5000/app", "。:5000/app")]
+        #[case("../app", "。。/app")]
+        fn only_dots(#[case] ascii: &str, #[case] unicode: &str) {
+            let expected = parse_host_as_written(ascii);
+            assert!(
+                expected.is_err(),
+                "{ascii:?} should be rejected, got {expected:?}"
+            );
+            for input in [ascii, unicode] {
+                let result = Reference::try_from(input);
+                assert!(
+                    result == expected,
+                    "{input:?} gives {result:?}, expected {expected:?}"
+                );
+            }
+        }
+
+        /// The error is the same as without the feature, even when IDNA rejects the host.
+        #[rstest]
+        #[case("bücher.example/App")]
+        #[case("-bücher.example/App")]
+        fn uppercase_repository(#[case] input: &str) {
+            assert_rejected(
+                |s| Reference::try_from(s),
+                input,
+                ParseError::NameContainsUppercase,
+            );
+        }
+
+        /// Every combination of these labels is either rejected or gives a reference whose
+        /// `whole()` parses back to the same reference, with and without the feature. A
+        /// combination that is rejected gives the same error as without the feature, or
+        /// `ReferenceInvalidFormat` for a host that can't be normalized.
+        #[test]
+        fn accepted_references_parse_back() {
+            let labels = [
+                "bücher",
+                "Bücher",
+                "faß",
+                "ΣΑΣ",
+                "ü--c",
+                "bü--c",
+                "ls---x",
+                "xn--bcher-kva",
+                "xn--not-valid",
+                "☃",
+                "שלום",
+                "aשלום",
+                "ｅｘａｍｐｌｅ",
+                "exam\u{AD}ple",
+                "\u{200D}",
+                "a",
+                "localhost",
+                "",
+            ];
+            let mut accepted = 0;
+            for (a, b) in labels
+                .iter()
+                .flat_map(|a| labels.iter().map(move |b| (a, b)))
+            {
+                for dot in [".", "\u{3002}"] {
+                    for rest in ["/app", ":5000/app", "/App", "/app:v1"] {
+                        let input = format!("{a}{dot}{b}{rest}");
+                        let reference = match Reference::try_from(input.as_str()) {
+                            Ok(reference) => reference,
+                            Err(err) => {
+                                let without = parse_host_as_written(&input);
+                                assert!(
+                                    without.as_ref().err() == Some(&err)
+                                        || (without.is_ok()
+                                            && err == ParseError::ReferenceInvalidFormat),
+                                    "{input:?} is rejected with {err:?}, but without the feature it gives {without:?}"
+                                );
+                                continue;
+                            }
+                        };
+                        accepted += 1;
+                        let whole = reference.whole();
+                        for (parser, reparsed) in [
+                            ("try_from", Reference::try_from(whole.as_str())),
+                            ("parse_host_as_written", parse_host_as_written(&whole)),
+                        ] {
+                            assert!(
+                                reparsed.as_ref() == Ok(&reference),
+                                "{input:?} gives {whole:?}, but {parser} parses that as {reparsed:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(accepted > 100, "only {accepted} inputs were accepted");
+        }
+
+        /// `Docker.IO` becomes Docker Hub, and `library/` then makes the name too long.
+        #[test]
+        fn docker_hub_name_too_long() {
+            let name = "a".repeat(251);
+            let input = format!("Docker.IO/{name}");
+            assert!(parse_host_as_written(&input).is_ok());
+            assert_rejected(|s| Reference::try_from(s), &input, ParseError::NameTooLong);
+            assert_rejected(
+                |s| Reference::try_from(s),
+                &format!("docker.io/{name}"),
+                ParseError::NameTooLong,
+            );
+        }
+
+        /// A host that can't be normalized makes the reference invalid, even though it
+        /// parses without the feature.
+        #[rstest]
+        // `_` is not allowed in a host. Without the feature, Go's rule makes the whole name
+        // the repository.
+        #[case("foo_bar.example/app")]
+        // IPv4 addresses that are not written in plain dotted decimal: short, hex and octal
+        // forms. `010.0.0.1` would be `8.0.0.1`.
+        #[case("127.1/app")]
+        #[case("0x7f.1/app")]
+        #[case("0177.0.0.1/app")]
+        #[case("010.0.0.1/app")]
+        #[case("127.0.0.01:5000/app")]
+        #[case("2130706433:5000/app")]
+        // Not valid IPv4 addresses: the URL Standard reads a host whose last label is a
+        // number as IPv4.
+        #[case("256.0.0.1/app")]
+        #[case("1.2.3.4.5/app")]
+        #[case("foo.0x/app")]
+        #[case("Example.1/app")]
+        // Not a valid IPv6 address (a group of 5 digits).
+        #[case("[00001::]/app")]
+        // Not valid punycode.
+        #[case("XN--A.example/app")]
+        // The Bidi rule for a right-to-left label (`xn--9dbne9b` is Hebrew) also applies to
+        // the other labels of the domain, so `1abc` may not start with a digit.
+        #[case("XN--9DBNE9B.1abc/app")]
+        fn invalid_host(#[case] input: &str) {
+            assert!(
+                parse_host_as_written(input).is_ok(),
+                "{input:?} should parse without the feature"
+            );
+            assert_rejected(
+                |s| Reference::try_from(s),
+                input,
+                ParseError::ReferenceInvalidFormat,
+            );
+        }
+
+        /// For ASCII input, the feature never accepts a reference that is rejected without
+        /// it. A reference that parses without it either gives the same repository, tag and
+        /// digest, with the host lowercased, kept as written (such as `A` in `A/a`, which
+        /// has no `.` or port) or as an IPv6 address in its normalized form, or is rejected
+        /// with `ReferenceInvalidFormat` because its host can't be normalized. Inputs are
+        /// all short strings made from a few chosen characters, which can't spell Docker
+        /// Hub's hosts: for those, lowercasing also applies the Docker Hub rules
+        /// (`Docker.IO/x` gives `docker.io/library/x`), see the `ascii` cases.
+        #[test]
+        fn ascii_inputs() {
+            let alphabet = ['a', 'A', '0', '.', '-', '_', ':', '/', '[', ']'];
+            let (mut changed, mut rejected) = (0, 0);
+            for input in all_strings(&alphabet, 6) {
+                let (ours, go) = (
+                    Reference::try_from(input.as_str()),
+                    parse_host_as_written(&input),
+                );
+                let (ours, go) = match (ours, go) {
+                    (Ok(ours), Ok(go)) => (ours, go),
+                    (Err(ParseError::ReferenceInvalidFormat), Ok(_)) => {
+                        let first = input.split('/').next().unwrap_or_default();
+                        assert!(
+                            input.contains('/') && first.contains(['.', ':', '[']),
+                            "{input:?} is rejected, but its first component is not a host"
+                        );
+                        rejected += 1;
+                        continue;
+                    }
+                    (ours, go) => {
+                        assert!(
+                            ours == go,
+                            "{input:?} gives {ours:?}, but without the feature {go:?}"
+                        );
+                        continue;
+                    }
+                };
+                changed += usize::from(ours != go);
+                assert!(
+                    [go.registry().to_ascii_lowercase().as_str(), go.registry()]
+                        .contains(&ours.registry())
+                        || go.registry().starts_with('['),
+                    "{input:?} gives the registry {:?}, but without the feature {:?}",
+                    ours.registry(),
+                    go.registry()
+                );
+                assert!(
+                    (ours.repository(), ours.tag(), ours.digest())
+                        == (go.repository(), go.tag(), go.digest()),
+                    "{input:?} gives {ours:?}, but without the feature {go:?}"
+                );
+            }
+            assert!(
+                changed > 100 && rejected > 50,
+                "only {changed} inputs changed and {rejected} were rejected, too few for this test to mean much"
+            );
+        }
+
+        /// IDNA rejects a domain longer than 253 bytes, so the reference is invalid, even for
+        /// an ASCII host that parses without the feature.
+        #[test]
+        fn domain_length() {
+            let labels = format!("{}.", "a".repeat(63)).repeat(3);
+            let ascii = |n| format!("xn--bcher-kva.{labels}{}", "a".repeat(n));
+            let unicode = |n| format!("bücher.{labels}{}/app", "a".repeat(n));
+            assert_eq!(253, ascii(47).len(), "the test domain should be 253 bytes");
+            assert_normalized(&unicode(47), &ascii(47), "app");
+            assert_rejected(
+                |s| Reference::try_from(s),
+                &unicode(48),
+                ParseError::ReferenceInvalidFormat,
+            );
+            let long = format!("Upper-case-abc.{labels}{}", "a".repeat(47));
+            assert_eq!(254, long.len(), "the long domain should be 254 bytes");
+            let long = format!("{long}/app");
+            assert!(parse_host_as_written(&long).is_ok());
+            assert_rejected(
+                |s| Reference::try_from(s),
+                &long,
+                ParseError::ReferenceInvalidFormat,
+            );
         }
     }
 
